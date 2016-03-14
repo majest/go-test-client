@@ -4,55 +4,36 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/gorilla/mux"
-	"github.com/majest/go-service-test/server"
-	"github.com/majest/go-strings-client/client"
+	"github.com/majest/go-test-service/pb"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
-var logger log.Logger
-var root context.Context
+var client pb.StringsClient
+var ctx context.Context
 
 func main() {
-	logger = log.NewLogfmtLogger(os.Stdout)
-	logger = log.NewContext(logger).With("caller", log.DefaultCaller)
-	logger = log.NewContext(logger).With("transport", "grpc")
+	go http.ListenAndServe(":36660", nil)
+	logger := log.NewLogfmtLogger(os.Stdout)
 
-	root = context.Background()
-	router := mux.NewRouter().StrictSlash(true)
-	router.HandleFunc("/count/{data}", Count)
-	logger.Log(http.ListenAndServe(":9010", router))
-}
+	ctx = context.Background()
 
-func trace(s string) (string, time.Time) {
-	fmt.Println("START:", s)
-	return s, time.Now()
-}
-
-func un(s string, startTime time.Time) {
-	endTime := time.Now()
-	fmt.Println("  END:", s, "ElapsedTime in seconds:", endTime.Sub(startTime))
-}
-
-func Count(w http.ResponseWriter, r *http.Request) {
-	defer un(trace("count"))
-	cc, err := grpc.Dial("localhost:9090", grpc.WithInsecure())
+	conn, err := grpc.Dial("localhost:9090", grpc.WithInsecure())
 	if err != nil {
-		logger.Log("err", err)
-		os.Exit(1)
+		logger.Log(err.Error())
 	}
-	defer cc.Close()
+	client = pb.NewStringsClient(conn)
 
-	vars := mux.Vars(r)
-	data := vars["data"]
+	router := mux.NewRouter().StrictSlash(true)
+	router.HandleFunc("/count/{data}", count)
+	logger.Log(http.ListenAndServe(":9091", router))
 
-	var svc server.StringService
+}
 
-	svc = client.New(root, cc, logger)
-	v := svc.Count(data)
-	fmt.Fprintln(w, "Data:", v)
+func count(w http.ResponseWriter, r *http.Request) {
+	res, _ := client.Count(ctx, &pb.CountRequest{A: mux.Vars(r)["data"]})
+	fmt.Fprintln(w, "Data:", res)
 }
