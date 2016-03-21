@@ -14,11 +14,12 @@ import (
 	"github.com/go-kit/kit/loadbalancer/consul"
 	"github.com/go-kit/kit/log"
 	kitratelimit "github.com/go-kit/kit/ratelimit"
-	grpctransport "github.com/go-kit/kit/transport/grpc"
 	"github.com/gorilla/mux"
-	"github.com/hashicorp/consul/api"
 	jujuratelimit "github.com/juju/ratelimit"
+	clb "github.com/majest/go-microservice/consul"
+	stringssvc "github.com/majest/go-test-client/string"
 	"github.com/majest/go-test-service/pb"
+	"github.com/majest/go-test-service/server"
 	"github.com/sony/gobreaker"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -53,96 +54,73 @@ var logger log.Logger
 
 func main() {
 	go http.ListenAndServe(":36660", nil)
+
 	ctx := context.Background()
 	logger = log.NewLogfmtLogger(os.Stdout)
 
-	config := api.DefaultConfig()
-
-	// consul address and port
-	config.Address = fmt.Sprintf("%s:%v", consulIP, consulPort)
-
-	c, errc := api.NewClient(config)
-
-	if errc != nil {
-		panic(errc.Error())
-	}
-
-	// consul client
-	client := consul.NewClient(c)
+	discoveryClient := consul.NewClient(
+		clb.New(
+			&clb.Config{
+				NodeIp:   consulIP,
+				NodePort: consulPort,
+			},
+		).Client)
 
 	var (
 		qps            = 100 // max to each instance
-		publisher, err = consul.NewPublisher(client, factory(ctx, qps), logger, "com.service.string")
+		publisher, err = consul.NewPublisher(discoveryClient, factory(ctx, qps), logger, "string")
 		lb             = loadbalancer.NewRoundRobin(publisher)
 		maxAttempts    = 3
 		maxTime        = 100 * time.Millisecond
-		endpoint       = loadbalancer.Retry(maxAttempts, maxTime, lb)
+		e              = loadbalancer.Retry(maxAttempts, maxTime, lb)
 	)
 
 	if err != nil {
 		panic(err.Error())
 	}
 
-	p = proxymw{ctx, endpoint}
-
 	router := mux.NewRouter().StrictSlash(true)
-	router.HandleFunc("/test/{data}", GetCount)
+	router.HandleFunc("/test/{data}", makeHandler(ctx, e, logger))
 	logger.Log(http.ListenAndServe(":8090", router))
 }
 
-func GetCount(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	data := vars["data"]
-	response, err := p.Call(data)
-	fmt.Fprintln(w, "Data:", response)
-	logger.Log("error", err)
-
-}
-
-func (mw proxymw) Call(name string) (int, error) {
-	r, err := mw.Endpoint(mw.Context, pb.CountRequest{A: name})
-
-	if err != nil {
-		return -1, err
+func makeHandler(ctx context.Context, e endpoint.Endpoint, logger log.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := mux.Vars(r)["data"]
+		resp, _ := e(ctx, data)
+		fmt.Fprintln(w, fmt.Sprintf("Data:%d", resp.(int)))
 	}
-	a := r.(*pb.CountReply)
-
-	return int(a.V), nil
 }
 
 func factory(ctx context.Context, qps int) loadbalancer.Factory {
 	return func(instance string) (endpoint.Endpoint, io.Closer, error) {
+
+		// loadbalancer factory should call grpc
 		var e endpoint.Endpoint
-		e = makeProxy(ctx, instance)
+		conn, err := grpc.Dial(instance, grpc.WithInsecure())
+		if err != nil {
+			return e, nil, err
+		}
+
+		// create a service
+		svc := stringssvc.New(ctx, conn, logger)
+
+		// make an endpoint out of serice, service should know about connextion
+		e = makeEndpoint(svc)
+
+		// circut breaker
 		e = circuitbreaker.Gobreaker(gobreaker.NewCircuitBreaker(gobreaker.Settings{}))(e)
+
+		// rate limiter
 		e = kitratelimit.NewTokenBucketLimiter(jujuratelimit.NewBucketWithRate(float64(qps), int64(qps)))(e)
 		return e, nil, nil
 	}
 }
 
-func makeProxy(ctx context.Context, instance string) endpoint.Endpoint {
-	fmt.Println()
-	conn, err := grpc.Dial(instance, grpc.WithInsecure())
-
-	if err != nil {
-		fmt.Println(err.Error())
+func makeEndpoint(svc server.StringsService) endpoint.Endpoint {
+	return func(ctx context.Context, request interface{}) (interface{}, error) {
+		req := request.(string)
+		resp := svc.Count(req)
+		return resp, nil
 	}
-
-	return grpctransport.NewClient(
-		conn,
-		"Strings",
-		"Count",
-		EncodeCountRequest,
-		DecodeCountResponse,
-		&pb.CountReply{}, // why?
-	).Endpoint()
-}
-
-func EncodeCountRequest(ctx context.Context, request interface{}) (interface{}, error) {
-	req := request.(pb.CountRequest)
-	return &req, nil
-}
-
-func DecodeCountResponse(ctx context.Context, response interface{}) (interface{}, error) {
-	return response, nil
 }
